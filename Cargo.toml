@@ -32,7 +32,7 @@ document-features = "0.2"
 console_error_panic_hook = "0.1"
 geo-types = "0.7"
 geo-buffer = "0.2"
-geo = "0.33"
+geo = { version = "0.33", default-features = false }
 env_logger = "0.11"
 
 [profile.dev]
