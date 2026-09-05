@@ -26,7 +26,11 @@ document-features = {workspace = true}
 rayon = { workspace = true }
 geo-types = { workspace = true }
 geo-buffer = { workspace = true }
+geo = { workspace = true }
 web-time = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
 
 [features]
 ## Enables support for the Strip Packing Problem

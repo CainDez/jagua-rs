@@ -5,6 +5,11 @@ use rand_distr::num_traits::ToPrimitive;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 
+use geo::{
+    Buffer,
+    algorithm::buffer::{BufferStyle, LineJoin},
+};
+
 use crate::geometry::geo_traits::{CollidesWith, DistanceTo};
 use crate::geometry::primitives::Edge;
 use crate::geometry::primitives::Point;
@@ -12,7 +17,9 @@ use crate::geometry::primitives::SPolygon;
 
 use crate::io::ext_repr::ExtSPolygon;
 use crate::io::import;
-use anyhow::{Result, bail};
+use anyhow::{Result, anyhow, bail};
+
+const ROBUST_OFFSET_RELATIVE_TOLERANCE: f64 = 1.0e-3;
 
 /// Whether to strictly inflate or deflate when making any modifications to shape.
 /// Depends on the [`position`](crate::collision_detection::hazards::HazardEntity::scope) of the [`HazardEntity`](crate::collision_detection::hazards::HazardEntity) that the shape represents.
@@ -336,7 +343,8 @@ impl CornerType {
 }
 
 /// Offsets a [`SPolygon`] by a certain `distance` either inwards or outwards depending on the [`ShapeModifyMode`].
-/// Relies on the [`geo_offset`](https://crates.io/crates/geo_offset) crate.
+/// Uses the legacy `geo-buffer` implementation first and retries with the topology-safe `geo`
+/// buffer when the legacy result cannot be represented as a simple polygon.
 pub fn offset_shape(sp: &SPolygon, mode: ShapeModifyMode, distance: f32) -> Result<SPolygon> {
     let offset = match mode {
         ShapeModifyMode::Deflate => -distance,
@@ -352,9 +360,49 @@ pub fn offset_shape(sp: &SPolygon, mode: ShapeModifyMode, distance: f32) -> Resu
         vec![],
     );
 
-    // Create the offset polygon
-    let geo_poly_offsets = geo_buffer::buffer_polygon_rounded(&geo_poly, f64::from(offset)).0;
+    match offset_shape_with_geo_buffer(&geo_poly, offset) {
+        Ok(offset_shape) => Ok(offset_shape),
+        Err(legacy_error) => {
+            warn!(
+                "Legacy polygon offset failed ({legacy_error:#}); retrying with topology-safe buffer."
+            );
+            offset_shape_with_robust_buffer(&geo_poly, offset).map_err(|robust_error| {
+                anyhow!(
+                    "Polygon offset failed in both implementations; legacy: {legacy_error:#}; robust: {robust_error:#}"
+                )
+            })
+        }
+    }
+}
 
+fn offset_shape_with_geo_buffer(
+    geo_poly: &geo_types::Polygon<f64>,
+    offset: f32,
+) -> Result<SPolygon> {
+    let geo_poly_offsets = geo_buffer::buffer_polygon_rounded(geo_poly, f64::from(offset)).0;
+    import_offset_polygon(&geo_poly_offsets, false)
+}
+
+fn offset_shape_with_robust_buffer(
+    geo_poly: &geo_types::Polygon<f64>,
+    offset: f32,
+) -> Result<SPolygon> {
+    let requested_offset = f64::from(offset);
+    let relative_tolerance = ROBUST_OFFSET_RELATIVE_TOLERANCE;
+    let chord_ratio = 2.0 * ((2.0 * relative_tolerance) - relative_tolerance.powi(2)).sqrt();
+    // Round joins are approximated by chords that lie inside the ideal arc. Increase the radius
+    // by the maximum relative sagitta so an inflated result remains a conservative superset (and
+    // a deflated result remains a conservative subset) of the requested offset.
+    let conservative_offset = requested_offset / (1.0 - relative_tolerance);
+    let style = BufferStyle::new(conservative_offset).line_join(LineJoin::Round(chord_ratio));
+    let geo_poly_offsets = geo_poly.buffer_with_style(style).0;
+    import_offset_polygon(&geo_poly_offsets, true)
+}
+
+fn import_offset_polygon(
+    geo_poly_offsets: &[geo_types::Polygon<f64>],
+    normalize_closed_ring: bool,
+) -> Result<SPolygon> {
     let geo_poly_offset = match geo_poly_offsets.len() {
         0 => bail!("Offset resulted in an empty polygon"),
         1 => &geo_poly_offsets[0],
@@ -366,14 +414,30 @@ pub fn offset_shape(sp: &SPolygon, mode: ShapeModifyMode, distance: f32) -> Resu
         }
     };
 
-    // Convert back to internal representation (by using the import function)
-    let ext_s_polygon = ExtSPolygon(
-        geo_poly_offset
-            .exterior()
-            .points()
-            .map(|p| (p.x().to_f32().unwrap(), p.y().to_f32().unwrap()))
-            .collect_vec(),
-    );
+    // Convert back to internal representation (by using the import function).
+    let mut points = geo_poly_offset
+        .exterior()
+        .points()
+        .map(|p| {
+            let x = p
+                .x()
+                .to_f32()
+                .ok_or_else(|| anyhow!("Offset x-coordinate cannot be represented as f32"))?;
+            let y = p
+                .y()
+                .to_f32()
+                .ok_or_else(|| anyhow!("Offset y-coordinate cannot be represented as f32"))?;
+            Ok((x, y))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    if normalize_closed_ring {
+        points.dedup();
+        if points.len() > 1 && points.first() == points.last() {
+            points.pop();
+        }
+    }
+    let ext_s_polygon = ExtSPolygon(points);
 
     import::import_simple_polygon(&ext_s_polygon)
 }
