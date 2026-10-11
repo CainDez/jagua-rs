@@ -13,6 +13,7 @@ use geo::{
 use crate::geometry::geo_traits::{CollidesWith, DistanceTo};
 use crate::geometry::primitives::Edge;
 use crate::geometry::primitives::Point;
+use crate::geometry::primitives::Rect;
 use crate::geometry::primitives::SPolygon;
 
 use crate::io::ext_repr::ExtSPolygon;
@@ -119,7 +120,7 @@ pub fn simplify_shape(
             .sorted_by_cached_key(|c| {
                 OrderedFloat(calculate_area_delta(&ref_points, c).unwrap_or(f32::INFINITY))
             })
-            .find(|c| candidate_is_valid(&ref_points, c));
+            .find(|c| candidate_is_valid(&ref_points, c, &shape.bbox));
 
         //if it is within the area change constraints, execute the candidate
         if let Some(best_candidate) = best_candidate {
@@ -188,7 +189,7 @@ fn calculate_area_delta(shape: &[Point], candidate: &Candidate) -> Result<f32, I
     Ok(area)
 }
 
-fn candidate_is_valid(shape: &[Point], candidate: &Candidate) -> bool {
+fn candidate_is_valid(shape: &[Point], candidate: &Candidate, bbox: &Rect) -> bool {
     //ensure the removal/replacement does not create any self intersections
     match candidate {
         Candidate::Collinear(_) => true,
@@ -205,6 +206,8 @@ fn candidate_is_valid(shape: &[Point], candidate: &Candidate) -> bool {
         Candidate::ConvexConvex(c1, c2) => {
             match replacing_vertex_convex_convex_candidate(shape, (*c1, *c2)) {
                 Err(_) => false,
+                // 上游 #119：简化不能扩大原始包围盒，避免原本能放入的固定方向零件失配。
+                Ok(new_vertex) if !bbox.collides_with(&new_vertex) => false,
                 Ok(new_vertex) => {
                     let new_edge_1 = Edge::try_new(shape[c1.0], new_vertex).unwrap();
                     let new_edge_2 = Edge::try_new(new_vertex, shape[c2.2]).unwrap();
@@ -611,4 +614,36 @@ pub fn shape_modification_valid(orig: &SPolygon, simpl: &SPolygon, mode: ShapeMo
         }
     }
     true
+}
+
+#[cfg(test)]
+mod upstream_regressions {
+    use super::*;
+
+    #[test]
+    fn simplification_does_not_grow_bounding_box() {
+        // Rectangle with a V-notch in its bottom edge, see sparrow#176.
+        // Replacing the corners at (0,0) and (15,0) by the intersection of their adjacent edges
+        // would add a vertex at (0,-30): a small area increase, but 30 units of extra height.
+        let points = [
+            (0.0, 0.0),
+            (15.0, 0.0),
+            (30.0, 30.0),
+            (45.0, 0.0),
+            (557.3, 0.0),
+            (557.3, 970.0),
+            (0.0, 970.0),
+        ];
+        let shape = SPolygon::new(points.map(|(x, y)| Point(x, y)).to_vec()).unwrap();
+
+        let simplified = simplify_shape(&shape, ShapeModifyMode::Inflate, 0.001);
+
+        assert!(simplified.n_vertices() < shape.n_vertices());
+        assert!(shape_modification_valid(
+            &shape,
+            &simplified,
+            ShapeModifyMode::Inflate
+        ));
+        assert_eq!(simplified.bbox, shape.bbox);
+    }
 }

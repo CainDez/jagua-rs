@@ -33,12 +33,13 @@ pub fn generate_piers(shape: &SPolygon, n: usize, poles: &[Circle]) -> Result<Ve
     let centroid = shape.centroid();
     //vertical ray from the centroid
     let base_ray = Edge::try_new(
-        Point(centroid.0, centroid.1 - 2.0 * expanded_bbox.height()),
-        Point(centroid.0, centroid.1 + 2.0 * expanded_bbox.height()),
+        Point(0.0, -2.0 * expanded_bbox.height()),
+        Point(0.0, 2.0 * expanded_bbox.height()),
     )
     .unwrap();
 
-    let transformations = generate_ray_transformations(expanded_bbox, RAYS_PER_ANGLE, N_ANGLES);
+    let transformations =
+        generate_ray_transformations(expanded_bbox, centroid, RAYS_PER_ANGLE, N_ANGLES);
 
     //transform the base edge by each transformation
     let rays = transformations
@@ -96,13 +97,14 @@ pub fn generate_piers(shape: &SPolygon, n: usize, poles: &[Circle]) -> Result<Ve
 #[allow(clippy::cast_precision_loss)]
 fn generate_ray_transformations(
     bbox: Rect,
+    centroid: Point,
     rays_per_angle: usize,
     n_angles: usize,
 ) -> Vec<Transformation> {
     //translations
     let dx = bbox.width() / rays_per_angle as f32;
     let translations = (0..rays_per_angle)
-        .map(|i| bbox.x_min + dx * i as f32)
+        .map(|i| bbox.x_min - centroid.0 + dx * i as f32)
         .map(|x| Transformation::from_translation((x, 0.0)))
         .collect_vec();
 
@@ -113,10 +115,11 @@ fn generate_ray_transformations(
     angles_slice
         .iter()
         .flat_map(|angle| {
-            translations
-                .iter()
-                .cloned()
-                .map(move |translation| translation.rotate(*angle))
+            translations.iter().cloned().map(move |translation| {
+                translation
+                    .rotate(*angle)
+                    .translate((centroid.0, centroid.1))
+            })
         })
         .collect_vec()
 }
@@ -225,4 +228,40 @@ fn min_distances_to_poles(points: &[Point], poles: &[Circle], forfeit_distance: 
                 .fold(forfeit_distance, f32::min)
         })
         .collect_vec()
+}
+
+#[cfg(test)]
+mod upstream_regressions {
+    use super::*;
+
+    #[test]
+    fn piers_are_translation_invariant() {
+        let l_shape = |(dx, dy): (f32, f32)| {
+            let points = [
+                (-2.25, -2.5),
+                (3.75, -2.5),
+                (3.75, -0.5),
+                (0.75, -0.5),
+                (0.75, 3.5),
+                (-2.25, 3.5),
+            ];
+            SPolygon::new(points.map(|(x, y)| Point(x + dx, y + dy)).to_vec()).unwrap()
+        };
+        let offset = (100.0, 50.0);
+        let centered = generate_piers(&l_shape((0.0, 0.0)), 2, &[]).unwrap();
+        let shifted = generate_piers(&l_shape(offset), 2, &[]).unwrap();
+
+        let t = Transformation::from_translation(offset);
+        for (c, s) in centered.iter().zip(&shifted) {
+            let expected = c.transform_clone(&t);
+            assert!(
+                expected.start.distance_to(&s.start) < 1e-3,
+                "{expected:?} != {s:?}"
+            );
+            assert!(
+                expected.end.distance_to(&s.end) < 1e-3,
+                "{expected:?} != {s:?}"
+            );
+        }
+    }
 }
